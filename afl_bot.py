@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import logging
 import os
+import ssl
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta
@@ -75,13 +76,21 @@ class NoTrading(Exception):
 
 
 def iss_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=30, headers={"User-Agent": "afl-daily-bot/1.0"})
+    tls = ssl.create_default_context()
+    # Official Russian Trusted Root CA from https://www.gosuslugi.ru/crt.
+    tls.load_verify_locations(cafile=Path(__file__).with_name("moex-root-ca.pem"))
+    return httpx.AsyncClient(
+        base_url=ISS_URL,
+        verify=tls,
+        timeout=30,
+        headers={"User-Agent": "afl-daily-bot/1.0"},
+    )
 
 
 async def iss_table(client: httpx.AsyncClient, path: str, block: str, params: dict | None = None) -> list[dict]:
     """Запрос к ISS. Возвращает таблицу `block` как список словарей."""
     query = {"iss.meta": "off", "iss.only": block, **(params or {})}
-    resp = await client.get(f"{ISS_URL}/{path}.json", params=query)
+    resp = await client.get(f"{path}.json", params=query)
     resp.raise_for_status()
     table = resp.json()[block]
     return [dict(zip(table["columns"], row)) for row in table["data"]]
