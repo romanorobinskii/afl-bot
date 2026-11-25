@@ -354,6 +354,25 @@ async def capture_market_map() -> bytes:
             chart = page.locator("#chart_div_shares svg.highcharts-root")
             labels = chart.locator(".highcharts-data-label text:visible").filter(has_text=re.compile(r"\d%"))
             await labels.nth(4).wait_for(state="visible", timeout=12_000)
+            # Highcharts can show the labels while its JavaScript clip animation still hides the tiles.
+            await page.wait_for_function(
+                """() => {
+                    const series = document.querySelector('#chart_div_shares .highcharts-treemap-series');
+                    if (!series) return false;
+                    const tiles = [...series.querySelectorAll('rect.highcharts-point')].filter(
+                        tile => Number(tile.getAttribute('width')) > 0 && Number(tile.getAttribute('height')) > 0
+                    );
+                    if (tiles.length < 5) return false;
+                    const clipUrl = series.getAttribute('clip-path');
+                    if (!clipUrl || clipUrl === 'none') return true;
+                    const clipId = clipUrl.slice(clipUrl.lastIndexOf('#') + 1, -1);
+                    const clip = document.getElementById(clipId)?.querySelector('rect');
+                    if (!clip) return false;
+                    const rightEdge = rect => Number(rect.getAttribute('x')) + Number(rect.getAttribute('width'));
+                    return rightEdge(clip) >= Math.max(...tiles.map(rightEdge)) - 1;
+                }""",
+                timeout=8_000,
+            )
             return await chart.screenshot(
                 type="png", animations="disabled", timeout=5_000,
                 style="#cookies_warning, .custom-pop-up { visibility: hidden !important; }",
