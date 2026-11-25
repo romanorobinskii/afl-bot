@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import ssl
 import sys
 from dataclasses import dataclass, field
@@ -26,7 +27,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import Update
+from telegram import InputFile, Update
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ═══════════════════════════════ НАСТРОЙКИ ═══════════════════════════════
@@ -67,8 +69,10 @@ MAX_CLOSE_VS_LAST_TRADE_PCT = 1.0
 ISS_URL = "https://iss.moex.com/iss"
 SHARE_PATH = f"engines/stock/markets/shares/boards/{BOARD}/securities/{TICKER}"
 INDEX_PATH = f"engines/stock/markets/index/securities/{INDEX}"
+MARKET_MAP_URL = "https://smart-lab.ru/q/map1/"
 
 log = logging.getLogger("afl_bot")
+market_map_lock = asyncio.Lock()
 
 
 class NoTrading(Exception):
@@ -322,6 +326,60 @@ async def notify_admin(bot, cfg: Config, text: str) -> None:
             log.exception("Не удалось написать админу")
 
 
+async def capture_market_map() -> bytes:
+    from playwright.async_api import async_playwright
+
+    async with market_map_lock, asyncio.timeout(40), async_playwright() as playwright:
+        browser_env = {
+            key: os.environ[key]
+            for key in ("PATH", "HOME", "LANG", "SYSTEMROOT", "TMP", "TEMP")
+            if key in os.environ
+        }
+        browser = await playwright.chromium.launch(env=browser_env)
+        try:
+            page = await browser.new_page(
+                viewport={"width": 1440, "height": 900}, locale="ru-RU", timezone_id="Europe/Moscow",
+                service_workers="block",
+            )
+            await page.route(re.compile(r"^(?!https://smart-lab\.ru/)"), lambda route: route.abort())
+            response = await page.goto(MARKET_MAP_URL, wait_until="domcontentloaded", timeout=20_000)
+            if response is None or not response.ok:
+                raise RuntimeError(f"Smart-Lab: HTTP {response.status if response else 'нет ответа'}")
+
+            chart = page.locator("#chart_div_shares svg.highcharts-root")
+            labels = chart.locator(".highcharts-data-label text:visible").filter(has_text=re.compile(r"\d%"))
+            await labels.nth(4).wait_for(state="visible", timeout=12_000)
+            return await chart.screenshot(
+                type="png", animations="disabled", timeout=5_000,
+                style="#cookies_warning, .custom-pop-up { visibility: hidden !important; }",
+            )
+        finally:
+            await browser.close()
+
+
+async def send_market_map(bot, recipients: list[int]) -> int | None:
+    try:
+        screenshot = await capture_market_map()
+    except Exception:
+        log.exception("Не удалось снять карту акций Smart-Lab")
+        return None
+
+    caption = f"Карта акций Smart-Lab за день · снимок в {datetime.now(MSK):%H:%M} МСК\n{MARKET_MAP_URL}"
+    file_id = None
+    sent = 0
+    for chat_id in recipients:
+        try:
+            message = await bot.send_photo(
+                chat_id, photo=file_id or InputFile(screenshot, filename="market-map.png"),
+                caption=caption, write_timeout=30,
+            )
+            file_id = message.photo[-1].file_id
+            sent += 1
+        except TelegramError:
+            log.exception("Не удалось отправить карту акций в chat_id %s", chat_id)
+    return sent
+
+
 async def send_report(bot, cfg: Config, wait: bool) -> None:
     today = datetime.now(MSK).date()
     give_up = datetime.combine(today, GIVE_UP_AT, MSK)
@@ -366,8 +424,12 @@ async def send_report(bot, cfg: Config, wait: bool) -> None:
         except Exception as exc:
             await notify_admin(bot, cfg, f"Не удалось отправить в chat_id {chat_id}: {exc!r}")
             return
+    sent_at = datetime.now(MSK)
+    maps_sent = await send_market_map(bot, cfg.recipients)
+    map_status = ("Скриншот карты Smart-Lab недоступен." if maps_sent is None
+                  else f"Карта Smart-Lab отправлена: {maps_sent} из {len(cfg.recipients)}.")
     notes = ("\nПримечания: " + "; ".join(snap.notes)) if snap.notes else ""
-    await notify_admin(bot, cfg, f"Сводка отправлена в {datetime.now(MSK):%H:%M}.{notes}")
+    await notify_admin(bot, cfg, f"Сводка отправлена в {sent_at:%H:%M}.\n{map_status}{notes}")
 
 
 def is_admin(update: Update, cfg: Config) -> bool:
@@ -384,7 +446,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if cfg.admin_id is None or is_admin(update, cfg):
         await update.message.reply_text(
             f"Бот работает. Ваш chat_id: {chat.id}\n\n"
-            "/preview — собрать сводку сейчас и показать вам\n"
+            "/preview — показать вам сводку и текущую карту акций\n"
             "/sendnow — отправить сегодняшнюю сводку получателям\n"
             "/id — показать chat_id")
         return
@@ -407,6 +469,8 @@ async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Не удалось собрать данные: {exc}")
         return
     await update.message.reply_text(admin_report(snap))
+    if not await send_market_map(context.bot, [update.effective_chat.id]):
+        await update.message.reply_text("Не удалось отправить скриншот карты Smart-Lab.")
 
 
 async def cmd_sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -451,10 +515,15 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе в лог попадает токен бота
 
     parser = argparse.ArgumentParser(description="Ежедневная сводка по акциям Аэрофлота в Telegram")
-    parser.add_argument("--print", action="store_true", help="собрать сводку и вывести в консоль, без Telegram")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--print", action="store_true", help="собрать сводку и вывести в консоль, без Telegram")
+    mode.add_argument("--market-map", type=Path, metavar="PNG", help="сохранить карту Smart-Lab, без Telegram")
     parser.add_argument("--date", type=date.fromisoformat, help="дата для --print в формате ГГГГ-ММ-ДД")
     args = parser.parse_args()
-    if args.print:
+    if args.market_map:
+        args.market_map.write_bytes(asyncio.run(capture_market_map()))
+        print(f"Карта сохранена в {args.market_map}")
+    elif args.print:
         try:
             asyncio.run(print_report(args.date))
         except NoTrading as exc:
