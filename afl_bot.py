@@ -338,7 +338,12 @@ async def capture_market_map() -> bytes:
         browser = await playwright.chromium.launch(env=browser_env)
         try:
             page = await browser.new_page(
-                viewport={"width": 1440, "height": 900}, locale="ru-RU", timezone_id="Europe/Moscow",
+                viewport={"width": 393, "height": 852},
+                device_scale_factor=2.5,
+                is_mobile=True,
+                has_touch=True,
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
                 service_workers="block",
             )
             await page.route(re.compile(r"^(?!https://smart-lab\.ru/)"), lambda route: route.abort())
